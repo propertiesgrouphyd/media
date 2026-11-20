@@ -1,0 +1,405 @@
+
+name: Vidhwaan Livemedia Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "index.html"
+      - "main.css"
+      - "app.js"
+      - "videos.json"
+      - "manifest.json"
+      - "sw.js"
+      - "videos/**"
+      - "icons/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: livemedia-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install build tools
+        run: |
+          npm install --no-save --package-lock=false html-minifier-terser clean-css terser javascript-obfuscator
+
+      - name: Validate encryption secret
+        env:
+          LIVEMEDIA_VIDEO_KEY: ${{ secrets.LIVEMEDIA_VIDEO_KEY }}
+        run: |
+          node - <<'NODE'
+          const key = Buffer.from(process.env.LIVEMEDIA_VIDEO_KEY || "", "base64");
+          if (key.length !== 32) {
+            console.error("LIVEMEDIA_VIDEO_KEY must be Base64 encoding of exactly 32 random bytes.");
+            process.exit(1);
+          }
+          console.log("AES-256 key validation successful.");
+          NODE
+
+      - name: Build encrypted video catalogue
+        env:
+          LIVEMEDIA_VIDEO_KEY: ${{ secrets.LIVEMEDIA_VIDEO_KEY }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const crypto = require("crypto");
+          const { spawnSync } = require("child_process");
+
+          const key = Buffer.from(process.env.LIVEMEDIA_VIDEO_KEY || "", "base64");
+          if (key.length !== 32) throw new Error("Invalid AES-256 key.");
+
+          const source = JSON.parse(fs.readFileSync("videos.json", "utf8"));
+          const dist = "dist";
+          const work = ".livemedia-build";
+
+          fs.rmSync(dist, { recursive: true, force: true });
+          fs.rmSync(work, { recursive: true, force: true });
+          fs.mkdirSync(dist, { recursive: true });
+          fs.mkdirSync(work, { recursive: true });
+
+          for (const file of [
+            "index.html",
+            "main.css",
+            "app.js",
+            "manifest.json",
+            "sw.js"
+          ]) {
+            if (!fs.existsSync(file)) {
+              throw new Error("Missing required file: " + file);
+            }
+            fs.copyFileSync(file, path.join(dist, file));
+          }
+
+          if (fs.existsSync("icons")) {
+            fs.cpSync("icons", path.join(dist, "icons"), {
+              recursive: true
+            });
+          }
+
+          fs.writeFileSync(
+            path.join(dist, "CNAME"),
+            "livemedia.vidhwaan.com\n"
+          );
+
+          function encryptFile(input, output) {
+            const iv = crypto.randomBytes(12);
+            const cipher = crypto.createCipheriv(
+              "aes-256-gcm",
+              key,
+              iv,
+              { authTagLength: 16 }
+            );
+
+            const plaintext = fs.readFileSync(input);
+            const encrypted = Buffer.concat([
+              cipher.update(plaintext),
+              cipher.final()
+            ]);
+
+            const tag = cipher.getAuthTag();
+
+            fs.mkdirSync(path.dirname(output), { recursive: true });
+            fs.writeFileSync(
+              output,
+              Buffer.concat([iv, encrypted, tag])
+            );
+          }
+
+          function processVideo(item, id, sourceFile) {
+            if (!fs.existsSync(sourceFile)) {
+              throw new Error("Missing source video: " + sourceFile);
+            }
+
+            const workDir = path.join(work, id);
+            const outputDir = path.join(dist, "media", id);
+
+            fs.mkdirSync(workDir, { recursive: true });
+            fs.mkdirSync(outputDir, { recursive: true });
+
+            const playlist = path.join(workDir, "playlist.m3u8");
+            const initFile = path.join(workDir, "init.mp4");
+            const segmentPattern = path.join(
+              workDir,
+              "segment-%05d.m4s"
+            );
+
+            const args = [
+              "-y",
+              "-i", sourceFile,
+              "-map", "0:v:0",
+              "-map", "0:a:0",
+              "-sn",
+              "-dn",
+              "-vf", "scale=trunc(min(1280\\,iw)/2)*2:-2",
+              "-c:v", "libx264",
+              "-preset", "veryfast",
+              "-profile:v", "high",
+              "-level:v", "3.1",
+              "-pix_fmt", "yuv420p",
+              "-crf", "23",
+              "-maxrate", "2500k",
+              "-bufsize", "5000k",
+              "-force_key_frames", "expr:gte(t,n_forced*4)",
+              "-c:a", "aac",
+              "-b:a", "128k",
+              "-ac", "2",
+              "-ar", "48000",
+              "-f", "hls",
+              "-hls_time", "4",
+              "-hls_playlist_type", "vod",
+              "-hls_segment_type", "fmp4",
+              "-hls_fmp4_init_filename", "init.mp4",
+              "-hls_segment_filename", segmentPattern,
+              "-hls_flags", "independent_segments",
+              playlist
+            ];
+
+            console.log("Processing:", sourceFile);
+
+            const result = spawnSync("ffmpeg", args, {
+              stdio: "inherit"
+            });
+
+            if (result.status !== 0) {
+              throw new Error("FFmpeg failed for " + sourceFile);
+            }
+
+            if (!fs.existsSync(initFile)) {
+              throw new Error("FFmpeg did not create init.mp4 for " + id);
+            }
+
+            const segments = fs.readdirSync(workDir)
+              .filter(name => /^segment-\d+\.m4s$/.test(name))
+              .sort();
+
+            if (!segments.length) {
+              throw new Error("No media segments generated for " + id);
+            }
+
+            encryptFile(
+              initFile,
+              path.join(outputDir, "init.dat")
+            );
+
+            const encryptedSegments = [];
+
+            for (const name of segments) {
+              const outputName = name.replace(".m4s", ".dat");
+              encryptFile(
+                path.join(workDir, name),
+                path.join(outputDir, outputName)
+              );
+              encryptedSegments.push(
+                "./media/" + id + "/" + outputName
+              );
+            }
+
+            item.mime = 'video/mp4; codecs="avc1.64001F,mp4a.40.2"';
+            item.init = "./media/" + id + "/init.dat";
+            item.segments = encryptedSegments;
+          }
+
+          if (!source.live || source.live.enabled !== false) {
+            processVideo(
+              source.live,
+              "live",
+              "videos/live.mp4"
+            );
+          }
+
+          for (const item of source.videos || []) {
+            if (item.enabled === false) continue;
+
+            if (!/^[a-zA-Z0-9_-]+$/.test(item.id || "")) {
+              throw new Error("Invalid video ID: " + item.id);
+            }
+
+            processVideo(
+              item,
+              item.id,
+              path.join("videos", item.id + ".mp4")
+            );
+
+            if (item.thumbnail) {
+              const thumbnailName = path.basename(item.thumbnail);
+              const thumbnailSource = path.join(
+                "videos",
+                "thumbnails",
+                thumbnailName
+              );
+
+              if (!fs.existsSync(thumbnailSource)) {
+                throw new Error(
+                  "Missing thumbnail: " + thumbnailSource
+                );
+              }
+
+              fs.mkdirSync(path.join(dist, "thumbnails"), {
+                recursive: true
+              });
+
+              fs.copyFileSync(
+                thumbnailSource,
+                path.join(dist, "thumbnails", thumbnailName)
+              );
+
+              item.thumbnail = "./thumbnails/" + thumbnailName;
+            }
+          }
+
+          fs.writeFileSync(
+            path.join(dist, "videos.json"),
+            JSON.stringify(source)
+          );
+
+          const appFile = path.join(dist, "app.js");
+          let app = fs.readFileSync(appFile, "utf8");
+
+          if (!app.includes("__LIVEMEDIA_VIDEO_KEY__")) {
+            throw new Error("Encryption key placeholder not found in app.js.");
+          }
+
+          app = app.replace(
+            "__LIVEMEDIA_VIDEO_KEY__",
+            key.toString("base64")
+          );
+
+          fs.writeFileSync(appFile, app);
+
+          console.log("Encrypted video catalogue generated.");
+          console.log("Encrypted video files:", source.videos.length + 1);
+          NODE
+
+      - name: Minify application files
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const CleanCSS = require("clean-css");
+          const { minify } = require("html-minifier-terser");
+
+          (async () => {
+            const html = fs.readFileSync("dist/index.html", "utf8");
+            const minifiedHTML = await minify(html, {
+              collapseWhitespace: true,
+              removeComments: true,
+              removeRedundantAttributes: true,
+              removeEmptyAttributes: true,
+              minifyCSS: true,
+              minifyJS: true
+            });
+            fs.writeFileSync("dist/index.html", minifiedHTML);
+
+            const css = fs.readFileSync("dist/main.css", "utf8");
+            const minifiedCSS = new CleanCSS().minify(css);
+
+            if (minifiedCSS.errors.length) {
+              throw new Error(minifiedCSS.errors.join("\n"));
+            }
+
+            fs.writeFileSync("dist/main.css", minifiedCSS.styles);
+
+            for (const file of [
+              "manifest.json",
+              "videos.json"
+            ]) {
+              const fullPath = "dist/" + file;
+              const json = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+              fs.writeFileSync(fullPath, JSON.stringify(json));
+            }
+
+            console.log("HTML, CSS and JSON minification completed.");
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
+
+      - name: Obfuscate JavaScript
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const Obfuscator = require("javascript-obfuscator");
+
+          const input = "dist/app.js";
+          const output = "dist/app.obfuscated.js";
+          const source = fs.readFileSync(input, "utf8");
+
+          const result = Obfuscator.obfuscate(source, {
+            compact: true,
+            controlFlowFlattening: false,
+            deadCodeInjection: false,
+            debugProtection: false,
+            disableConsoleOutput: false,
+            identifierNamesGenerator: "hexadecimal",
+            renameGlobals: false,
+            selfDefending: false,
+            stringArray: true,
+            stringArrayEncoding: [],
+            stringArrayThreshold: 0.5,
+            transformObjectKeys: false,
+            unicodeEscapeSequence: false
+          });
+
+          fs.writeFileSync(output, result.getObfuscatedCode());
+          fs.renameSync(output, input);
+
+          console.log("JavaScript obfuscation completed.");
+          NODE
+
+      - name: Verify deployment files
+        run: |
+          set -e
+          test -s dist/index.html
+          test -s dist/main.css
+          test -s dist/app.js
+          test -s dist/videos.json
+          test -s dist/manifest.json
+          test -s dist/sw.js
+          test -s dist/CNAME
+          test -d dist/media
+          if find dist -type f \( -name "*.mp4" -o -name "*.m4s" -o -name "*.m3u8" \) | grep -q .; then
+            echo "ERROR: Original or unencrypted video files found in deployment."
+            exit 1
+          fi
+          echo "Deployment verification successful."
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
