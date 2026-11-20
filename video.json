@@ -1,0 +1,52 @@
+
+{
+  "appName": "VIDHWAAN LIVEMEDIA",
+  "version": "1.0.0",
+  "encryption": {
+    "algorithm": "AES-256-GCM",
+    "keyId": "livemedia-main",
+    "ivBytes": 12,
+    "tagBytes": 16
+  },
+  "live": {
+    "id": "live-001",
+    "title": "Vidhwaan Live",
+    "description": "Enjoy continuous video on Vidhwaan Livemedia.",
+    "enabled": true,
+    "mime": "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"",
+    "init": "./media/live/init.dat",
+    "segments": [
+      "./media/live/segment-00000.dat",
+      "./media/live/segment-00001.dat"
+    ],
+    "loop": true
+  },
+  "videos": [
+    {
+      "id": "video-001",
+      "title": "Welcome to Vidhwaan",
+      "description": "Discover the world of Vidhwaan.",
+      "thumbnail": "./thumbnails/video-001.webp",
+      "enabled": true,
+      "mime": "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"",
+      "init": "./media/video-001/init.dat",
+      "segments": [
+        "./media/video-001/segment-00000.dat",
+        "./media/video-001/segment-00001.dat"
+      ]
+    },
+    {
+      "id": "video-002",
+      "title": "Vidhwaan Technology",
+      "description": "Explore technology and innovation.",
+      "thumbnail": "./thumbnails/video-002.webp",
+      "enabled": true,
+      "mime": "video/mp4; codecs=\"avc1.42E01E,mp4a.40.2\"",
+      "init": "./media/video-002/init.dat",
+      "segments": [
+        "./media/video-002/segment-00000.dat",
+        "./media/video-002/segment-00001.dat"
+      ]
+    }
+  ]
+}
