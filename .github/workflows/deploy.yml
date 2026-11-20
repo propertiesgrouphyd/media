@@ -29,9 +29,6 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Checkout repository
@@ -54,16 +51,35 @@ jobs:
         run: |
           npm install --no-save --package-lock=false html-minifier-terser clean-css terser javascript-obfuscator
 
+      - name: Verify source files
+        run: |
+          set -e
+          for file in index.html main.css app.js videos.json manifest.json sw.js; do
+            if [ ! -s "$file" ]; then
+              echo "ERROR: Missing source file: $file"
+              exit 1
+            fi
+          done
+
+          python3 -m json.tool videos.json > /dev/null
+
+          test -f videos/live.mp4
+          test -d icons
+
+          echo "Source files verified."
+
       - name: Validate encryption secret
         env:
           LIVEMEDIA_VIDEO_KEY: ${{ secrets.LIVEMEDIA_VIDEO_KEY }}
         run: |
           node - <<'NODE'
           const key = Buffer.from(process.env.LIVEMEDIA_VIDEO_KEY || "", "base64");
+
           if (key.length !== 32) {
             console.error("LIVEMEDIA_VIDEO_KEY must be Base64 encoding of exactly 32 random bytes.");
             process.exit(1);
           }
+
           console.log("AES-256 key validation successful.");
           NODE
 
@@ -78,14 +94,23 @@ jobs:
           const { spawnSync } = require("child_process");
 
           const key = Buffer.from(process.env.LIVEMEDIA_VIDEO_KEY || "", "base64");
-          if (key.length !== 32) throw new Error("Invalid AES-256 key.");
+
+          if (key.length !== 32) {
+            throw new Error("Invalid AES-256 key.");
+          }
 
           const source = JSON.parse(fs.readFileSync("videos.json", "utf8"));
+
+          if (!source.live || !Array.isArray(source.videos)) {
+            throw new Error("videos.json must contain live and videos entries.");
+          }
+
           const dist = "dist";
           const work = ".livemedia-build";
 
           fs.rmSync(dist, { recursive: true, force: true });
           fs.rmSync(work, { recursive: true, force: true });
+
           fs.mkdirSync(dist, { recursive: true });
           fs.mkdirSync(work, { recursive: true });
 
@@ -99,6 +124,7 @@ jobs:
             if (!fs.existsSync(file)) {
               throw new Error("Missing required file: " + file);
             }
+
             fs.copyFileSync(file, path.join(dist, file));
           }
 
@@ -115,6 +141,7 @@ jobs:
 
           function encryptFile(input, output) {
             const iv = crypto.randomBytes(12);
+
             const cipher = crypto.createCipheriv(
               "aes-256-gcm",
               key,
@@ -123,6 +150,7 @@ jobs:
             );
 
             const plaintext = fs.readFileSync(input);
+
             const encrypted = Buffer.concat([
               cipher.update(plaintext),
               cipher.final()
@@ -130,7 +158,10 @@ jobs:
 
             const tag = cipher.getAuthTag();
 
-            fs.mkdirSync(path.dirname(output), { recursive: true });
+            fs.mkdirSync(path.dirname(output), {
+              recursive: true
+            });
+
             fs.writeFileSync(
               output,
               Buffer.concat([iv, encrypted, tag])
@@ -150,6 +181,7 @@ jobs:
 
             const playlist = path.join(workDir, "playlist.m3u8");
             const initFile = path.join(workDir, "init.mp4");
+
             const segmentPattern = path.join(
               workDir,
               "segment-%05d.m4s"
@@ -186,7 +218,7 @@ jobs:
               playlist
             ];
 
-            console.log("Processing:", sourceFile);
+            console.log("Processing video:", sourceFile);
 
             const result = spawnSync("ffmpeg", args, {
               stdio: "inherit"
@@ -197,7 +229,7 @@ jobs:
             }
 
             if (!fs.existsSync(initFile)) {
-              throw new Error("FFmpeg did not create init.mp4 for " + id);
+              throw new Error("Missing initialization segment: " + id);
             }
 
             const segments = fs.readdirSync(workDir)
@@ -217,10 +249,12 @@ jobs:
 
             for (const name of segments) {
               const outputName = name.replace(".m4s", ".dat");
+
               encryptFile(
                 path.join(workDir, name),
                 path.join(outputDir, outputName)
               );
+
               encryptedSegments.push(
                 "./media/" + id + "/" + outputName
               );
@@ -229,9 +263,13 @@ jobs:
             item.mime = 'video/mp4; codecs="avc1.64001F,mp4a.40.2"';
             item.init = "./media/" + id + "/init.dat";
             item.segments = encryptedSegments;
+
+            console.log(
+              "Encrypted " + id + ": " + encryptedSegments.length + " segments"
+            );
           }
 
-          if (!source.live || source.live.enabled !== false) {
+          if (source.live.enabled !== false) {
             processVideo(
               source.live,
               "live",
@@ -239,7 +277,7 @@ jobs:
             );
           }
 
-          for (const item of source.videos || []) {
+          for (const item of source.videos) {
             if (item.enabled === false) continue;
 
             if (!/^[a-zA-Z0-9_-]+$/.test(item.id || "")) {
@@ -254,6 +292,7 @@ jobs:
 
             if (item.thumbnail) {
               const thumbnailName = path.basename(item.thumbnail);
+
               const thumbnailSource = path.join(
                 "videos",
                 "thumbnails",
@@ -261,9 +300,7 @@ jobs:
               );
 
               if (!fs.existsSync(thumbnailSource)) {
-                throw new Error(
-                  "Missing thumbnail: " + thumbnailSource
-                );
+                throw new Error("Missing thumbnail: " + thumbnailSource);
               }
 
               fs.mkdirSync(path.join(dist, "thumbnails"), {
@@ -299,7 +336,7 @@ jobs:
           fs.writeFileSync(appFile, app);
 
           console.log("Encrypted video catalogue generated.");
-          console.log("Encrypted video files:", source.videos.length + 1);
+          console.log("Video processing completed.");
           NODE
 
       - name: Minify application files
@@ -311,6 +348,7 @@ jobs:
 
           (async () => {
             const html = fs.readFileSync("dist/index.html", "utf8");
+
             const minifiedHTML = await minify(html, {
               collapseWhitespace: true,
               removeComments: true,
@@ -319,6 +357,7 @@ jobs:
               minifyCSS: true,
               minifyJS: true
             });
+
             fs.writeFileSync("dist/index.html", minifiedHTML);
 
             const css = fs.readFileSync("dist/main.css", "utf8");
@@ -336,7 +375,11 @@ jobs:
             ]) {
               const fullPath = "dist/" + file;
               const json = JSON.parse(fs.readFileSync(fullPath, "utf8"));
-              fs.writeFileSync(fullPath, JSON.stringify(json));
+
+              fs.writeFileSync(
+                fullPath,
+                JSON.stringify(json)
+              );
             }
 
             console.log("HTML, CSS and JSON minification completed.");
@@ -354,6 +397,7 @@ jobs:
 
           const input = "dist/app.js";
           const output = "dist/app.obfuscated.js";
+
           const source = fs.readFileSync(input, "utf8");
 
           const result = Obfuscator.obfuscate(source, {
@@ -372,7 +416,11 @@ jobs:
             unicodeEscapeSequence: false
           });
 
-          fs.writeFileSync(output, result.getObfuscatedCode());
+          fs.writeFileSync(
+            output,
+            result.getObfuscatedCode()
+          );
+
           fs.renameSync(output, input);
 
           console.log("JavaScript obfuscation completed.");
@@ -381,6 +429,7 @@ jobs:
       - name: Verify deployment files
         run: |
           set -e
+
           test -s dist/index.html
           test -s dist/main.css
           test -s dist/app.js
@@ -389,17 +438,29 @@ jobs:
           test -s dist/sw.js
           test -s dist/CNAME
           test -d dist/media
+
           if find dist -type f \( -name "*.mp4" -o -name "*.m4s" -o -name "*.m3u8" \) | grep -q .; then
             echo "ERROR: Original or unencrypted video files found in deployment."
             exit 1
           fi
+
           echo "Deployment verification successful."
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
+          name: github-pages
           path: dist
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
